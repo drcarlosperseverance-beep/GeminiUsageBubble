@@ -47,8 +47,8 @@ jobs:
               applicationId = "com.geminibubble.app"
               minSdk = 26
               targetSdk = 35
-              versionCode = 1
-              versionName = "1.0.0"
+              versionCode = 2
+              versionName = "1.1.0"
             }
             compileOptions {
               sourceCompatibility = JavaVersion.VERSION_17
@@ -74,7 +74,7 @@ jobs:
               </activity>
               <activity android:name=".SyncActivity" android:exported="false"/>
               <service android:name=".BubbleService" android:exported="false" android:foregroundServiceType="specialUse">
-                <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="Floating blue bubble for Gemini usage percentages"/>
+                <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="Floating aurora bubble for Gemini usage percentages"/>
               </service>
             </application>
           </manifest>
@@ -93,56 +93,108 @@ jobs:
           import android.graphics.Typeface
           import android.graphics.drawable.GradientDrawable
           import android.net.Uri
-          import android.os.Build
-          import android.os.Bundle
-          import android.os.IBinder
+          import android.os.*
           import android.provider.Settings
           import android.view.*
           import android.webkit.*
           import android.widget.*
           import org.json.JSONObject
-          import java.text.SimpleDateFormat
-          import java.util.*
           import kotlin.math.abs
 
           object Store {
-            const val ACTION = "com.geminibubble.app.UPDATED"
+            const val ACTION_UPDATED = "com.geminibubble.app.UPDATED"
+            const val ACTION_CONFIG = "com.geminibubble.app.CONFIG"
+            const val ACTION_SYNC_NOW = "com.geminibubble.app.SYNC_NOW"
+            const val GEMINI_URL = "https://gemini.google.com/usage"
+            const val EXTRACT_JS = "(function(){const t=(document.body&&document.body.innerText)||'';const ls=t.split(/\\r?\\n/).map(s=>s.trim()).filter(Boolean);function fp(ks){for(let i=0;i<ls.length;i++){const lo=ls[i].toLowerCase();if(ks.some(k=>lo.includes(k))){const w=ls.slice(i,i+4).join(' ');const m=w.match(/(\\d{1,3})\\s*%/);if(m){const v=parseInt(m[1],10);return /restante|remaining|left|disponible/i.test(w)?v:Math.max(0,Math.min(100,100-v));}}}return -1;}let h5=fp(['5 hour','5-hour','5 hora','5 horas','five hour']);let wk=fp(['weekly','semanal','semana','week']);if(h5<0||wk<0){const all=[...ls.join(' ').matchAll(/(\\d{1,3})\\s*%/g)].map(m=>parseInt(m[1],10));if(h5<0&&all.length>=1)h5=Math.max(0,Math.min(100,100-all[0]));if(wk<0&&all.length>=2)wk=Math.max(0,Math.min(100,100-all[1]));}return JSON.stringify({h5:h5,wk:wk});})();"
+
             private fun prefs(c: Context) = c.getSharedPreferences("gemini_bubble", Context.MODE_PRIVATE)
             fun get5h(c: Context) = prefs(c).getInt("h5", 100).coerceIn(0, 100)
             fun getWk(c: Context) = prefs(c).getInt("wk", 100).coerceIn(0, 100)
-            fun getTime(c: Context) = prefs(c).getString("ts", "sin sincronizar") ?: "sin sincronizar"
+            fun getTs(c: Context) = prefs(c).getLong("ts_ms", 0L)
+            fun isAuto(c: Context) = prefs(c).getBoolean("auto", true)
+            fun getMin(c: Context) = prefs(c).getInt("min", 2).coerceIn(2, 60)
             fun isRun(c: Context) = prefs(c).getBoolean("run", false)
             fun setRun(c: Context, v: Boolean) = prefs(c).edit().putBoolean("run", v).apply()
             fun savePos(c: Context, x: Int, y: Int) = prefs(c).edit().putInt("px", x).putInt("py", y).apply()
             fun posX(c: Context) = prefs(c).getInt("px", 40)
             fun posY(c: Context) = prefs(c).getInt("py", 220)
+
+            fun saveConfig(c: Context, auto: Boolean, min: Int) {
+              prefs(c).edit().putBoolean("auto", auto).putInt("min", min.coerceIn(2, 60)).apply()
+              c.sendBroadcast(Intent(ACTION_CONFIG).setPackage(c.packageName))
+            }
+
             fun save(c: Context, h5: Int, wk: Int) {
-              val ts = SimpleDateFormat("dd/MM HH:mm", Locale.getDefault()).format(Date())
-              prefs(c).edit().putInt("h5", h5.coerceIn(0, 100)).putInt("wk", wk.coerceIn(0, 100)).putString("ts", ts).apply()
-              c.sendBroadcast(Intent(ACTION).setPackage(c.packageName))
+              prefs(c).edit()
+                .putInt("h5", h5.coerceIn(0, 100))
+                .putInt("wk", wk.coerceIn(0, 100))
+                .putLong("ts_ms", System.currentTimeMillis())
+                .apply()
+              c.sendBroadcast(Intent(ACTION_UPDATED).setPackage(c.packageName))
+            }
+
+            fun relTime(ts: Long): String {
+              if (ts <= 0L) return "--"
+              val sec = ((System.currentTimeMillis() - ts) / 1000L).coerceAtLeast(0L)
+              return when {
+                sec < 60L -> "ahora"
+                sec < 3600L -> "hace ${sec / 60L}m"
+                else -> "hace ${sec / 3600L}h"
+              }
             }
           }
 
           fun dp(c: Context, v: Int) = (v * c.resources.displayMetrics.density).toInt()
 
-          fun blueBubbleBg(c: Context) = GradientDrawable(
+          fun auroraBg(c: Context) = GradientDrawable(
             GradientDrawable.Orientation.TL_BR,
-            intArrayOf(0xFF2979FF.toInt(), 0xFF0D47A1.toInt())
+            intArrayOf(0xFF1565C0.toInt(), 0xFF6A1B9A.toInt(), 0xFF00838F.toInt())
           ).apply {
-            shape = GradientDrawable.OVAL
-            setStroke(dp(c, 2), 0xFF90CAF9.toInt())
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = dp(c, 8).toFloat()
+            setStroke(dp(c, 1), 0x88B3E5FC.toInt())
           }
 
           class BubbleService : Service() {
             companion object { const val STOP = "com.geminibubble.app.STOP"; const val CH = "gb_ch" }
             private lateinit var wm: WindowManager
+            private val handler = Handler(Looper.getMainLooper())
             private var view: View? = null
+            private var bgWebView: WebView? = null
             private var tv5: TextView? = null
             private var tvW: TextView? = null
-            private val rx = object : BroadcastReceiver() {
-              override fun onReceive(c: Context?, i: Intent?) { refresh(); updateNotif() }
+            private var tvT: TextView? = null
+            private var syncFound = false
+
+            private val tickTask = object : Runnable {
+              override fun run() {
+                refresh()
+                handler.postDelayed(this, 15_000L)
+              }
             }
+
+            private val autoSyncTask = object : Runnable {
+              override fun run() {
+                if (Store.isAuto(this@BubbleService)) {
+                  triggerBgSync()
+                  handler.postDelayed(this, Store.getMin(this@BubbleService) * 60_000L)
+                }
+              }
+            }
+
+            private val rx = object : BroadcastReceiver() {
+              override fun onReceive(c: Context?, i: Intent?) {
+                when (i?.action) {
+                  Store.ACTION_UPDATED -> { refresh(); updateNotif() }
+                  Store.ACTION_CONFIG -> scheduleAutoSync(false)
+                  Store.ACTION_SYNC_NOW -> triggerBgSync()
+                }
+              }
+            }
+
             override fun onBind(i: Intent?): IBinder? = null
+
             override fun onCreate() {
               super.onCreate()
               wm = getSystemService(WINDOW_SERVICE) as WindowManager
@@ -152,41 +204,126 @@ jobs:
               if (Build.VERSION.SDK_INT >= 34) startForeground(1, notif(), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
               else startForeground(1, notif())
               Store.setRun(this, true)
-              if (Build.VERSION.SDK_INT >= 33) registerReceiver(rx, IntentFilter(Store.ACTION), Context.RECEIVER_NOT_EXPORTED)
-              else registerReceiver(rx, IntentFilter(Store.ACTION))
+              val filter = IntentFilter().apply {
+                addAction(Store.ACTION_UPDATED)
+                addAction(Store.ACTION_CONFIG)
+                addAction(Store.ACTION_SYNC_NOW)
+              }
+              if (Build.VERSION.SDK_INT >= 33) registerReceiver(rx, filter, Context.RECEIVER_NOT_EXPORTED)
+              else registerReceiver(rx, filter)
               showBubble()
+              handler.postDelayed(tickTask, 15_000L)
+              scheduleAutoSync(true)
             }
+
             override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
               if (i?.action == STOP) { stopSelf(); return START_NOT_STICKY }
-              refresh(); return START_STICKY
+              refresh()
+              return START_STICKY
             }
+
+            private fun scheduleAutoSync(runSoon: Boolean) {
+              handler.removeCallbacks(autoSyncTask)
+              if (Store.isAuto(this)) {
+                val delay = if (runSoon) 3_000L else Store.getMin(this) * 60_000L
+                handler.postDelayed(autoSyncTask, delay)
+              }
+            }
+
+            @SuppressLint("SetJavaScriptEnabled")
+            private fun ensureBgWebView(): WebView {
+              bgWebView?.let { return it }
+              val wv = WebView(this).apply {
+                alpha = 0f
+                settings.javaScriptEnabled = true
+                settings.domStorageEnabled = true
+                webViewClient = object : WebViewClient() {
+                  override fun onPageFinished(v: WebView?, u: String?) {
+                    syncFound = false
+                    listOf(3_000L, 6_000L, 10_000L).forEach { delay ->
+                      handler.postDelayed({ if (!syncFound) evalBgUsage() }, delay)
+                    }
+                  }
+                }
+              }
+              CookieManager.getInstance().setAcceptCookie(true)
+              CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
+              val lp = WindowManager.LayoutParams(
+                1, 1, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+                PixelFormat.TRANSLUCENT
+              ).apply { gravity = Gravity.TOP or Gravity.START; x = 0; y = 0 }
+              wm.addView(wv, lp)
+              bgWebView = wv
+              return wv
+            }
+
+            private fun triggerBgSync() {
+              try {
+                syncFound = false
+                ensureBgWebView().loadUrl(Store.GEMINI_URL)
+              } catch (_: Exception) {}
+            }
+
+            private fun evalBgUsage() {
+              val wv = bgWebView ?: return
+              wv.evaluateJavascript(Store.EXTRACT_JS) { res ->
+                try {
+                  val s = res?.trim()?.removeSurrounding("\"")?.replace("\\\"", "\"") ?: "{}"
+                  val o = JSONObject(s)
+                  val h5 = o.optInt("h5", -1)
+                  val wk = o.optInt("wk", -1)
+                  if (h5 in 0..100 && wk in 0..100) {
+                    syncFound = true
+                    Store.save(this, h5, wk)
+                  }
+                } catch (_: Exception) {}
+              }
+            }
+
             @SuppressLint("ClickableViewAccessibility")
             private fun showBubble() {
               if (view != null) return
               val box = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 gravity = Gravity.CENTER
-                background = blueBubbleBg(context)
-                elevation = dp(context, 8).toFloat()
-                setPadding(dp(context, 6), dp(context, 6), dp(context, 6), dp(context, 6))
+                background = auroraBg(context)
+                elevation = dp(context, 6).toFloat()
+                minimumWidth = dp(context, 54)
+                setPadding(dp(context, 6), dp(context, 4), dp(context, 6), dp(context, 4))
               }
-              tv5 = TextView(this).apply { setTextColor(Color.WHITE); textSize = 12f; setTypeface(null, Typeface.BOLD); gravity = Gravity.CENTER }
-              val sep = View(this).apply { setBackgroundColor(0x66FFFFFF); layoutParams = LinearLayout.LayoutParams(dp(context, 40), dp(context, 1)).apply { topMargin = dp(context, 3); bottomMargin = dp(context, 3) } }
-              tvW = TextView(this).apply { setTextColor(0xFFE3F2FD.toInt()); textSize = 11f; setTypeface(null, Typeface.BOLD); gravity = Gravity.CENTER }
-              box.addView(tv5); box.addView(sep); box.addView(tvW)
-              val size = dp(this, 76)
+              tv5 = TextView(this).apply {
+                setTextColor(Color.WHITE); textSize = 11f; setTypeface(null, Typeface.BOLD)
+                gravity = Gravity.CENTER; includeFontPadding = false
+              }
+              tvW = TextView(this).apply {
+                setTextColor(0xFFF3E5F5.toInt()); textSize = 11f; setTypeface(null, Typeface.BOLD)
+                gravity = Gravity.CENTER; includeFontPadding = false
+                setPadding(0, dp(context, 1), 0, dp(context, 1))
+              }
+              tvT = TextView(this).apply {
+                setTextColor(0xFFE0F7FA.toInt()); textSize = 9f
+                gravity = Gravity.CENTER; includeFontPadding = false
+              }
+              box.addView(tv5); box.addView(tvW); box.addView(tvT)
               val lp = WindowManager.LayoutParams(
-                size, size, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
                 PixelFormat.TRANSLUCENT
-              ).apply { gravity = Gravity.TOP or Gravity.START; x = Store.posX(this@BubbleService); y = Store.posY(this@BubbleService) }
+              ).apply {
+                gravity = Gravity.TOP or Gravity.START
+                x = Store.posX(this@BubbleService)
+                y = Store.posY(this@BubbleService)
+              }
               var ix = 0; var iy = 0; var tx = 0f; var ty = 0f; var drag = false
               box.setOnTouchListener { _, e ->
                 when (e.action) {
                   MotionEvent.ACTION_DOWN -> { ix = lp.x; iy = lp.y; tx = e.rawX; ty = e.rawY; drag = false; true }
                   MotionEvent.ACTION_MOVE -> {
                     val dx = (e.rawX - tx).toInt(); val dy = (e.rawY - ty).toInt()
-                    if (abs(dx) > 14 || abs(dy) > 14) drag = true
+                    if (abs(dx) > 12 || abs(dy) > 12) drag = true
                     lp.x = ix + dx; lp.y = iy + dy; wm.updateViewLayout(box, lp); true
                   }
                   MotionEvent.ACTION_UP -> {
@@ -199,85 +336,160 @@ jobs:
               }
               wm.addView(box, lp); view = box; refresh()
             }
+
             private fun refresh() {
               tv5?.text = "5h ${Store.get5h(this)}%"
-              tvW?.text = "Sem ${Store.getWk(this)}%"
+              tvW?.text = "S ${Store.getWk(this)}%"
+              tvT?.text = Store.relTime(Store.getTs(this))
             }
+
             private fun notif(): Notification {
               val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
               val stop = PendingIntent.getService(this, 1, Intent(this, BubbleService::class.java).setAction(STOP), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
               return Notification.Builder(this, CH)
                 .setSmallIcon(android.R.drawable.ic_dialog_info)
-                .setContentTitle("UsageBubble Gemini activa")
-                .setContentText("Restante: 5h ${Store.get5h(this)}% · Sem ${Store.getWk(this)}%")
+                .setContentTitle("UsageBubble Gemini")
+                .setContentText("5h ${Store.get5h(this)}% · S ${Store.getWk(this)}% · ${Store.relTime(Store.getTs(this))}")
                 .setOngoing(true).setContentIntent(open)
                 .addAction(Notification.Action.Builder(null, "Ocultar", stop).build())
                 .build()
             }
+
             private fun updateNotif() = getSystemService(NotificationManager::class.java).notify(1, notif())
+
             override fun onDestroy() {
-              super.onDestroy(); Store.setRun(this, false)
+              super.onDestroy()
+              Store.setRun(this, false)
+              handler.removeCallbacksAndMessages(null)
               try { unregisterReceiver(rx) } catch (_: Exception) {}
               view?.let { try { wm.removeView(it) } catch (_: Exception) {} }; view = null
+              bgWebView?.let {
+                try { wm.removeView(it) } catch (_: Exception) {}
+                it.destroy()
+              }; bgWebView = null
             }
           }
 
           class MainActivity : Activity() {
-            private lateinit var tv5: TextView; private lateinit var tvW: TextView; private lateinit var tvTs: TextView
+            private lateinit var tv5: TextView; private lateinit var tvW: TextView; private lateinit var tvT: TextView
+            private lateinit var lbMin: TextView; private lateinit var cbAuto: CheckBox; private lateinit var sbMin: SeekBar
             private lateinit var lb5: TextView; private lateinit var lbW: TextView
             private lateinit var sb5: SeekBar; private lateinit var sbW: SeekBar; private lateinit var btnToggle: Button
             private val rx = object : BroadcastReceiver() { override fun onReceive(c: Context?, i: Intent?) { render() } }
+
             override fun onCreate(b: Bundle?) {
               super.onCreate(b)
-              val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(0xFFF5F8FD.toInt()); setPadding(dp(context, 20), dp(context, 24), dp(context, 20), dp(context, 24)) }
-              root.addView(TextView(this).apply { text = "UsageBubble Gemini"; textSize = 26f; setTypeface(null, Typeface.BOLD); setTextColor(0xFF0D47A1.toInt()) })
-              root.addView(TextView(this).apply { text = "Burbuja azul arrastrable para ver cuánto porcentaje queda de Gemini (5 horas y semanal)."; textSize = 14f; setTextColor(0xFF486581.toInt()); setPadding(0, dp(context, 6), 0, dp(context, 18)) })
-              val preview = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER; background = blueBubbleBg(context); layoutParams = LinearLayout.LayoutParams(dp(context, 96), dp(context, 96)).apply { gravity = Gravity.CENTER_HORIZONTAL } }
-              tv5 = TextView(this).apply { setTextColor(Color.WHITE); textSize = 15f; setTypeface(null, Typeface.BOLD); gravity = Gravity.CENTER }
-              tvW = TextView(this).apply { setTextColor(0xFFE3F2FD.toInt()); textSize = 13f; setTypeface(null, Typeface.BOLD); gravity = Gravity.CENTER }
-              preview.addView(tv5); preview.addView(tvW); root.addView(preview)
-              tvTs = TextView(this).apply { gravity = Gravity.CENTER; textSize = 12f; setTextColor(0xFF486581.toInt()); setPadding(0, dp(context, 10), 0, dp(context, 16)) }
-              root.addView(tvTs)
-              btnToggle = Button(this).apply { setBackgroundColor(0xFF1A73E8.toInt()); setTextColor(Color.WHITE) }
+              val root = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setBackgroundColor(0xFFF5F7FC.toInt())
+                setPadding(dp(context, 20), dp(context, 22), dp(context, 20), dp(context, 24))
+              }
+              root.addView(TextView(this).apply { text = "UsageBubble Gemini"; textSize = 24f; setTypeface(null, Typeface.BOLD); setTextColor(0xFF1565C0.toInt()) })
+              root.addView(TextView(this).apply { text = "Burbuja compacta aurora para 5h y semanal (S) con auto-actualización."; textSize = 13f; setTextColor(0xFF486581.toInt()); setPadding(0, dp(context, 4), 0, dp(context, 16)) })
+
+              val preview = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER; background = auroraBg(context)
+                minimumWidth = dp(context, 62)
+                setPadding(dp(context, 8), dp(context, 6), dp(context, 8), dp(context, 6))
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { gravity = Gravity.CENTER_HORIZONTAL }
+              }
+              tv5 = TextView(this).apply { setTextColor(Color.WHITE); textSize = 12f; setTypeface(null, Typeface.BOLD); gravity = Gravity.CENTER }
+              tvW = TextView(this).apply { setTextColor(0xFFF3E5F5.toInt()); textSize = 12f; setTypeface(null, Typeface.BOLD); gravity = Gravity.CENTER }
+              tvT = TextView(this).apply { setTextColor(0xFFE0F7FA.toInt()); textSize = 10f; gravity = Gravity.CENTER }
+              preview.addView(tv5); preview.addView(tvW); preview.addView(tvT)
+              root.addView(preview)
+
+              btnToggle = Button(this).apply {
+                setBackgroundColor(0xFF1A73E8.toInt()); setTextColor(Color.WHITE)
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(context, 16) }
+              }
               btnToggle.setOnClickListener {
                 if (Store.isRun(this)) { stopService(Intent(this, BubbleService::class.java)); Store.setRun(this, false); updateBtn() }
                 else startFlow()
               }
               root.addView(btnToggle)
-              val btnSync = Button(this).apply { text = "Sincronizar desde Gemini Web"; setBackgroundColor(0xFFE8F0FE.toInt()); setTextColor(0xFF0D47A1.toInt()); layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(context, 10) } }
+
+              val btnSync = Button(this).apply {
+                text = "Iniciar sesión / Sincronizar Gemini Web"
+                setBackgroundColor(0xFFE8F0FE.toInt()); setTextColor(0xFF0D47A1.toInt())
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(context, 8) }
+              }
               btnSync.setOnClickListener { startActivity(Intent(this, SyncActivity::class.java)) }
               root.addView(btnSync)
-              lb5 = TextView(this).apply { setTextColor(0xFF102A43.toInt()); setPadding(0, dp(context, 20), 0, dp(context, 4)) }
+
+              val btnNow = Button(this).apply {
+                text = "Refrescar en segundo plano ahora"
+                setBackgroundColor(0xFFEDE7F6.toInt()); setTextColor(0xFF4A148C.toInt())
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(context, 8) }
+              }
+              btnNow.setOnClickListener {
+                sendBroadcast(Intent(Store.ACTION_SYNC_NOW).setPackage(packageName))
+                Toast.makeText(this, "Actualizando desde Gemini...", Toast.LENGTH_SHORT).show()
+              }
+              root.addView(btnNow)
+
+              cbAuto = CheckBox(this).apply {
+                text = "Auto-actualización activa"
+                setTextColor(0xFF102A43.toInt())
+                setPadding(0, dp(context, 16), 0, dp(context, 4))
+              }
+              lbMin = TextView(this).apply { setTextColor(0xFF102A43.toInt()); textSize = 14f }
+              sbMin = SeekBar(this).apply { max = 58 }
+              cbAuto.setOnCheckedChangeListener { _, checked -> Store.saveConfig(this, checked, sbMin.progress + 2) }
+              sbMin.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) {
+                  val m = p + 2
+                  lbMin.text = "Frecuencia: cada $m min (mínimo 2 min)"
+                  if (u) Store.saveConfig(this@MainActivity, cbAuto.isChecked, m)
+                }
+                override fun onStartTrackingTouch(s: SeekBar?) {}
+                override fun onStopTrackingTouch(s: SeekBar?) {}
+              })
+              root.addView(cbAuto); root.addView(lbMin); root.addView(sbMin)
+
+              lb5 = TextView(this).apply { setTextColor(0xFF486581.toInt()); setPadding(0, dp(context, 18), 0, dp(context, 2)) }
               sb5 = SeekBar(this).apply { max = 100 }
               sb5.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) { lb5.text = "Restante 5 horas: $p%" }
+                override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) { lb5.text = "Manual 5h: $p%" }
                 override fun onStartTrackingTouch(s: SeekBar?) {}
                 override fun onStopTrackingTouch(s: SeekBar?) {}
               })
-              lbW = TextView(this).apply { setTextColor(0xFF102A43.toInt()); setPadding(0, dp(context, 12), 0, dp(context, 4)) }
+              lbW = TextView(this).apply { setTextColor(0xFF486581.toInt()); setPadding(0, dp(context, 8), 0, dp(context, 2)) }
               sbW = SeekBar(this).apply { max = 100 }
               sbW.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) { lbW.text = "Restante semanal: $p%" }
+                override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) { lbW.text = "Manual S: $p%" }
                 override fun onStartTrackingTouch(s: SeekBar?) {}
                 override fun onStopTrackingTouch(s: SeekBar?) {}
               })
-              val btnSave = Button(this).apply { text = "Actualizar burbuja manualmente"; setBackgroundColor(0xFF1557B0.toInt()); setTextColor(Color.WHITE); layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(context, 12) } }
-              btnSave.setOnClickListener { Store.save(this, sb5.progress, sbW.progress); render(); Toast.makeText(this, "Burbuja actualizada", Toast.LENGTH_SHORT).show() }
+              val btnSave = Button(this).apply {
+                text = "Guardar manual"
+                setBackgroundColor(0xFF00838F.toInt()); setTextColor(Color.WHITE)
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(context, 10) }
+              }
+              btnSave.setOnClickListener { Store.save(this, sb5.progress, sbW.progress); render(); Toast.makeText(this, "Actualizado", Toast.LENGTH_SHORT).show() }
               root.addView(lb5); root.addView(sb5); root.addView(lbW); root.addView(sbW); root.addView(btnSave)
               setContentView(ScrollView(this).apply { addView(root) })
             }
+
             override fun onResume() {
               super.onResume()
-              if (Build.VERSION.SDK_INT >= 33) registerReceiver(rx, IntentFilter(Store.ACTION), Context.RECEIVER_NOT_EXPORTED)
-              else registerReceiver(rx, IntentFilter(Store.ACTION))
+              if (Build.VERSION.SDK_INT >= 33) registerReceiver(rx, IntentFilter(Store.ACTION_UPDATED), Context.RECEIVER_NOT_EXPORTED)
+              else registerReceiver(rx, IntentFilter(Store.ACTION_UPDATED))
               render(); updateBtn()
             }
+
             override fun onPause() { super.onPause(); try { unregisterReceiver(rx) } catch (_: Exception) {} }
+
             private fun render() {
-              val h5 = Store.get5h(this); val wk = Store.getWk(this)
-              tv5.text = "5h $h5%"; tvW.text = "Sem $wk%"; tvTs.text = "Última actualización: ${Store.getTime(this)}"
-              sb5.progress = h5; sbW.progress = wk; lb5.text = "Restante 5 horas: $h5%"; lbW.text = "Restante semanal: $wk%"
+              val h5 = Store.get5h(this); val wk = Store.getWk(this); val m = Store.getMin(this)
+              tv5.text = "5h $h5%"; tvW.text = "S $wk%"; tvT.text = Store.relTime(Store.getTs(this))
+              cbAuto.isChecked = Store.isAuto(this)
+              sbMin.progress = (m - 2).coerceIn(0, 58)
+              lbMin.text = "Frecuencia: cada $m min (mínimo 2 min)"
+              sb5.progress = h5; sbW.progress = wk
+              lb5.text = "Manual 5h: $h5%"; lbW.text = "Manual S: $wk%"
             }
+
             private fun updateBtn() {
               btnToggle.text = when {
                 !Settings.canDrawOverlays(this) -> "Conceder permiso de superposición"
@@ -285,6 +497,7 @@ jobs:
                 else -> "Activar burbuja flotante"
               }
             }
+
             private fun startFlow() {
               if (!Settings.canDrawOverlays(this)) {
                 startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
@@ -295,6 +508,7 @@ jobs:
               }
               startForegroundService(Intent(this, BubbleService::class.java)); Store.setRun(this, true); updateBtn()
             }
+
             override fun onRequestPermissionsResult(rc: Int, p: Array<out String>, r: IntArray) {
               super.onRequestPermissionsResult(rc, p, r)
               startForegroundService(Intent(this, BubbleService::class.java)); Store.setRun(this, true); updateBtn()
@@ -307,8 +521,8 @@ jobs:
             override fun onCreate(b: Bundle?) {
               super.onCreate(b)
               val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-              val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setBackgroundColor(0xFF1A73E8.toInt()); setPadding(dp(context, 10), dp(context, 10), dp(context, 10), dp(context, 10)); gravity = Gravity.CENTER_VERTICAL }
-              val title = TextView(this).apply { text = "Abrí Límites de uso en Gemini"; setTextColor(Color.WHITE); textSize = 13f; layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f) }
+              val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setBackgroundColor(0xFF1565C0.toInt()); setPadding(dp(context, 10), dp(context, 10), dp(context, 10), dp(context, 10)); gravity = Gravity.CENTER_VERTICAL }
+              val title = TextView(this).apply { text = "Iniciá sesión en Gemini Usage"; setTextColor(Color.WHITE); textSize = 13f; layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f) }
               val btn = Button(this).apply { text = "Leer ahora"; setBackgroundColor(Color.WHITE); setTextColor(0xFF0D47A1.toInt()) }
               bar.addView(title); bar.addView(btn)
               st = TextView(this).apply { text = "Cargando gemini.google.com/usage..."; setBackgroundColor(0xFFE8F0FE.toInt()); setTextColor(0xFF0D47A1.toInt()); setPadding(dp(context, 10), dp(context, 6), dp(context, 10), dp(context, 6)); textSize = 12f }
@@ -323,20 +537,20 @@ jobs:
               btn.setOnClickListener { readUsage() }
               root.addView(bar); root.addView(st); root.addView(wv)
               setContentView(root)
-              wv.loadUrl("https://gemini.google.com/usage")
+              wv.loadUrl(Store.GEMINI_URL)
             }
             private fun readUsage() {
-              val js = "(function(){const t=(document.body&&document.body.innerText)||'';const ls=t.split(/\\r?\\n/).map(s=>s.trim()).filter(Boolean);function fp(ks){for(let i=0;i<ls.length;i++){const lo=ls[i].toLowerCase();if(ks.some(k=>lo.includes(k))){const w=ls.slice(i,i+4).join(' ');const m=w.match(/(\\d{1,3})\\s*%/);if(m){const v=parseInt(m[1],10);return /restante|remaining|left|disponible/i.test(w)?v:Math.max(0,Math.min(100,100-v));}}}return -1;}let h5=fp(['5 hour','5-hour','5 hora','5 horas','five hour']);let wk=fp(['weekly','semanal','semana','week']);if(h5<0||wk<0){const all=[...ls.join(' ').matchAll(/(\\d{1,3})\\s*%/g)].map(m=>parseInt(m[1],10));if(h5<0&&all.length>=1)h5=Math.max(0,Math.min(100,100-all[0]));if(wk<0&&all.length>=2)wk=Math.max(0,Math.min(100,100-all[1]));}return JSON.stringify({h5:h5,wk:wk});})();"
-              wv.evaluateJavascript(js) { res ->
+              wv.evaluateJavascript(Store.EXTRACT_JS) { res ->
                 try {
                   val s = res?.trim()?.removeSurrounding("\"")?.replace("\\\"", "\"") ?: "{}"
                   val o = JSONObject(s); val h5 = o.optInt("h5", -1); val wk = o.optInt("wk", -1)
                   if (h5 in 0..100 && wk in 0..100) {
                     Store.save(this, h5, wk)
-                    Toast.makeText(this, "Sincronizado: 5h $h5% · Sem $wk%", Toast.LENGTH_LONG).show()
+                    CookieManager.getInstance().flush()
+                    Toast.makeText(this, "Sincronizado: 5h $h5% · S $wk%", Toast.LENGTH_LONG).show()
                     finish()
                   } else st.text = "No se detectaron los porcentajes. Entrá a Ajustes → Límites de uso y tocá 'Leer ahora'."
-                } catch (_: Exception) { st.text = "No se pudo leer la página; podés actualizar manualmente." }
+                } catch (_: Exception) { st.text = "No se pudo leer la página." }
               }
             }
           }
@@ -346,12 +560,12 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: GeminiUsageBubble-APK
+          name: GeminiUsageBubble-v1.1.0-APK
           path: app/build/outputs/apk/debug/app-debug.apk
       - name: Publish Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          cp app/build/outputs/apk/debug/app-debug.apk GeminiUsageBubble.apk
-          gh release delete v1.0.0 -y || true
-          gh release create v1.0.0 GeminiUsageBubble.apk --title "GeminiUsageBubble v1.0.0" --notes "Burbuja flotante azul para porcentaje restante de Gemini (5h y semanal)."
+          cp app/build/outputs/apk/debug/app-debug.apk GeminiUsageBubble-v1.1.0.apk
+          gh release delete v1.1.0 -y || true
+          gh release create v1.1.0 GeminiUsageBubble-v1.1.0.apk --title "GeminiUsageBubble v1.1.0" --notes "Burbuja cuadradita compacta estilo aurora boreal, formato 5h / S / tiempo relativo y auto-actualización configurable desde 2 minutos."
