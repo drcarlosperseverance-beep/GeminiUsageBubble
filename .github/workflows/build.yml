@@ -1,0 +1,357 @@
+name: Build GeminiUsageBubble APK
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Generate Android Project
+        run: |
+          mkdir -p app/src/main/java/com/geminibubble/app
+          cat <<'EOF' > settings.gradle.kts
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
+          rootProject.name = "GeminiUsageBubble"
+          include(":app")
+          EOF
+          cat <<'EOF' > build.gradle.kts
+          plugins {
+            id("com.android.application") version "8.5.2" apply false
+            id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat <<'EOF' > gradle.properties
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=false
+          EOF
+          cat <<'EOF' > app/build.gradle.kts
+          plugins {
+            id("com.android.application")
+            id("org.jetbrains.kotlin.android")
+          }
+          android {
+            namespace = "com.geminibubble.app"
+            compileSdk = 35
+            defaultConfig {
+              applicationId = "com.geminibubble.app"
+              minSdk = 26
+              targetSdk = 35
+              versionCode = 1
+              versionName = "1.0.0"
+            }
+            compileOptions {
+              sourceCompatibility = JavaVersion.VERSION_17
+              targetCompatibility = JavaVersion.VERSION_17
+            }
+            kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          cat <<'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+            <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+            <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
+            <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+            <uses-permission android:name="android.permission.INTERNET"/>
+            <application android:label="UsageBubble Gemini" android:icon="@android:drawable/ic_dialog_info" android:theme="@android:style/Theme.Material.Light.NoActionBar">
+              <activity android:name=".MainActivity" android:exported="true">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN"/>
+                  <category android:name="android.intent.category.LAUNCHER"/>
+                </intent-filter>
+              </activity>
+              <activity android:name=".SyncActivity" android:exported="false"/>
+              <service android:name=".BubbleService" android:exported="false" android:foregroundServiceType="specialUse">
+                <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="Floating blue bubble for Gemini usage percentages"/>
+              </service>
+            </application>
+          </manifest>
+          EOF
+          cat <<'EOF' > app/src/main/java/com/geminibubble/app/Main.kt
+          package com.geminibubble.app
+
+          import android.Manifest
+          import android.annotation.SuppressLint
+          import android.app.*
+          import android.content.*
+          import android.content.pm.PackageManager
+          import android.content.pm.ServiceInfo
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.IBinder
+          import android.provider.Settings
+          import android.view.*
+          import android.webkit.*
+          import android.widget.*
+          import org.json.JSONObject
+          import java.text.SimpleDateFormat
+          import java.util.*
+          import kotlin.math.abs
+
+          object Store {
+            const val ACTION = "com.geminibubble.app.UPDATED"
+            private fun prefs(c: Context) = c.getSharedPreferences("gemini_bubble", Context.MODE_PRIVATE)
+            fun get5h(c: Context) = prefs(c).getInt("h5", 100).coerceIn(0, 100)
+            fun getWk(c: Context) = prefs(c).getInt("wk", 100).coerceIn(0, 100)
+            fun getTime(c: Context) = prefs(c).getString("ts", "sin sincronizar") ?: "sin sincronizar"
+            fun isRun(c: Context) = prefs(c).getBoolean("run", false)
+            fun setRun(c: Context, v: Boolean) = prefs(c).edit().putBoolean("run", v).apply()
+            fun savePos(c: Context, x: Int, y: Int) = prefs(c).edit().putInt("px", x).putInt("py", y).apply()
+            fun posX(c: Context) = prefs(c).getInt("px", 40)
+            fun posY(c: Context) = prefs(c).getInt("py", 220)
+            fun save(c: Context, h5: Int, wk: Int) {
+              val ts = SimpleDateFormat("dd/MM HH:mm", Locale.getDefault()).format(Date())
+              prefs(c).edit().putInt("h5", h5.coerceIn(0, 100)).putInt("wk", wk.coerceIn(0, 100)).putString("ts", ts).apply()
+              c.sendBroadcast(Intent(ACTION).setPackage(c.packageName))
+            }
+          }
+
+          fun dp(c: Context, v: Int) = (v * c.resources.displayMetrics.density).toInt()
+
+          fun blueBubbleBg(c: Context) = GradientDrawable(
+            GradientDrawable.Orientation.TL_BR,
+            intArrayOf(0xFF2979FF.toInt(), 0xFF0D47A1.toInt())
+          ).apply {
+            shape = GradientDrawable.OVAL
+            setStroke(dp(c, 2), 0xFF90CAF9.toInt())
+          }
+
+          class BubbleService : Service() {
+            companion object { const val STOP = "com.geminibubble.app.STOP"; const val CH = "gb_ch" }
+            private lateinit var wm: WindowManager
+            private var view: View? = null
+            private var tv5: TextView? = null
+            private var tvW: TextView? = null
+            private val rx = object : BroadcastReceiver() {
+              override fun onReceive(c: Context?, i: Intent?) { refresh(); updateNotif() }
+            }
+            override fun onBind(i: Intent?): IBinder? = null
+            override fun onCreate() {
+              super.onCreate()
+              wm = getSystemService(WINDOW_SERVICE) as WindowManager
+              getSystemService(NotificationManager::class.java).createNotificationChannel(
+                NotificationChannel(CH, "UsageBubble Gemini", NotificationManager.IMPORTANCE_LOW)
+              )
+              if (Build.VERSION.SDK_INT >= 34) startForeground(1, notif(), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+              else startForeground(1, notif())
+              Store.setRun(this, true)
+              if (Build.VERSION.SDK_INT >= 33) registerReceiver(rx, IntentFilter(Store.ACTION), Context.RECEIVER_NOT_EXPORTED)
+              else registerReceiver(rx, IntentFilter(Store.ACTION))
+              showBubble()
+            }
+            override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+              if (i?.action == STOP) { stopSelf(); return START_NOT_STICKY }
+              refresh(); return START_STICKY
+            }
+            @SuppressLint("ClickableViewAccessibility")
+            private fun showBubble() {
+              if (view != null) return
+              val box = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER
+                background = blueBubbleBg(context)
+                elevation = dp(context, 8).toFloat()
+                setPadding(dp(context, 6), dp(context, 6), dp(context, 6), dp(context, 6))
+              }
+              tv5 = TextView(this).apply { setTextColor(Color.WHITE); textSize = 12f; setTypeface(null, Typeface.BOLD); gravity = Gravity.CENTER }
+              val sep = View(this).apply { setBackgroundColor(0x66FFFFFF); layoutParams = LinearLayout.LayoutParams(dp(context, 40), dp(context, 1)).apply { topMargin = dp(context, 3); bottomMargin = dp(context, 3) } }
+              tvW = TextView(this).apply { setTextColor(0xFFE3F2FD.toInt()); textSize = 11f; setTypeface(null, Typeface.BOLD); gravity = Gravity.CENTER }
+              box.addView(tv5); box.addView(sep); box.addView(tvW)
+              val size = dp(this, 76)
+              val lp = WindowManager.LayoutParams(
+                size, size, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT
+              ).apply { gravity = Gravity.TOP or Gravity.START; x = Store.posX(this@BubbleService); y = Store.posY(this@BubbleService) }
+              var ix = 0; var iy = 0; var tx = 0f; var ty = 0f; var drag = false
+              box.setOnTouchListener { _, e ->
+                when (e.action) {
+                  MotionEvent.ACTION_DOWN -> { ix = lp.x; iy = lp.y; tx = e.rawX; ty = e.rawY; drag = false; true }
+                  MotionEvent.ACTION_MOVE -> {
+                    val dx = (e.rawX - tx).toInt(); val dy = (e.rawY - ty).toInt()
+                    if (abs(dx) > 14 || abs(dy) > 14) drag = true
+                    lp.x = ix + dx; lp.y = iy + dy; wm.updateViewLayout(box, lp); true
+                  }
+                  MotionEvent.ACTION_UP -> {
+                    Store.savePos(this, lp.x, lp.y)
+                    if (!drag) startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP))
+                    true
+                  }
+                  else -> false
+                }
+              }
+              wm.addView(box, lp); view = box; refresh()
+            }
+            private fun refresh() {
+              tv5?.text = "5h ${Store.get5h(this)}%"
+              tvW?.text = "Sem ${Store.getWk(this)}%"
+            }
+            private fun notif(): Notification {
+              val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+              val stop = PendingIntent.getService(this, 1, Intent(this, BubbleService::class.java).setAction(STOP), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+              return Notification.Builder(this, CH)
+                .setSmallIcon(android.R.drawable.ic_dialog_info)
+                .setContentTitle("UsageBubble Gemini activa")
+                .setContentText("Restante: 5h ${Store.get5h(this)}% · Sem ${Store.getWk(this)}%")
+                .setOngoing(true).setContentIntent(open)
+                .addAction(Notification.Action.Builder(null, "Ocultar", stop).build())
+                .build()
+            }
+            private fun updateNotif() = getSystemService(NotificationManager::class.java).notify(1, notif())
+            override fun onDestroy() {
+              super.onDestroy(); Store.setRun(this, false)
+              try { unregisterReceiver(rx) } catch (_: Exception) {}
+              view?.let { try { wm.removeView(it) } catch (_: Exception) {} }; view = null
+            }
+          }
+
+          class MainActivity : Activity() {
+            private lateinit var tv5: TextView; private lateinit var tvW: TextView; private lateinit var tvTs: TextView
+            private lateinit var lb5: TextView; private lateinit var lbW: TextView
+            private lateinit var sb5: SeekBar; private lateinit var sbW: SeekBar; private lateinit var btnToggle: Button
+            private val rx = object : BroadcastReceiver() { override fun onReceive(c: Context?, i: Intent?) { render() } }
+            override fun onCreate(b: Bundle?) {
+              super.onCreate(b)
+              val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(0xFFF5F8FD.toInt()); setPadding(dp(context, 20), dp(context, 24), dp(context, 20), dp(context, 24)) }
+              root.addView(TextView(this).apply { text = "UsageBubble Gemini"; textSize = 26f; setTypeface(null, Typeface.BOLD); setTextColor(0xFF0D47A1.toInt()) })
+              root.addView(TextView(this).apply { text = "Burbuja azul arrastrable para ver cuánto porcentaje queda de Gemini (5 horas y semanal)."; textSize = 14f; setTextColor(0xFF486581.toInt()); setPadding(0, dp(context, 6), 0, dp(context, 18)) })
+              val preview = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER; background = blueBubbleBg(context); layoutParams = LinearLayout.LayoutParams(dp(context, 96), dp(context, 96)).apply { gravity = Gravity.CENTER_HORIZONTAL } }
+              tv5 = TextView(this).apply { setTextColor(Color.WHITE); textSize = 15f; setTypeface(null, Typeface.BOLD); gravity = Gravity.CENTER }
+              tvW = TextView(this).apply { setTextColor(0xFFE3F2FD.toInt()); textSize = 13f; setTypeface(null, Typeface.BOLD); gravity = Gravity.CENTER }
+              preview.addView(tv5); preview.addView(tvW); root.addView(preview)
+              tvTs = TextView(this).apply { gravity = Gravity.CENTER; textSize = 12f; setTextColor(0xFF486581.toInt()); setPadding(0, dp(context, 10), 0, dp(context, 16)) }
+              root.addView(tvTs)
+              btnToggle = Button(this).apply { setBackgroundColor(0xFF1A73E8.toInt()); setTextColor(Color.WHITE) }
+              btnToggle.setOnClickListener {
+                if (Store.isRun(this)) { stopService(Intent(this, BubbleService::class.java)); Store.setRun(this, false); updateBtn() }
+                else startFlow()
+              }
+              root.addView(btnToggle)
+              val btnSync = Button(this).apply { text = "Sincronizar desde Gemini Web"; setBackgroundColor(0xFFE8F0FE.toInt()); setTextColor(0xFF0D47A1.toInt()); layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(context, 10) } }
+              btnSync.setOnClickListener { startActivity(Intent(this, SyncActivity::class.java)) }
+              root.addView(btnSync)
+              lb5 = TextView(this).apply { setTextColor(0xFF102A43.toInt()); setPadding(0, dp(context, 20), 0, dp(context, 4)) }
+              sb5 = SeekBar(this).apply { max = 100 }
+              sb5.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) { lb5.text = "Restante 5 horas: $p%" }
+                override fun onStartTrackingTouch(s: SeekBar?) {}
+                override fun onStopTrackingTouch(s: SeekBar?) {}
+              })
+              lbW = TextView(this).apply { setTextColor(0xFF102A43.toInt()); setPadding(0, dp(context, 12), 0, dp(context, 4)) }
+              sbW = SeekBar(this).apply { max = 100 }
+              sbW.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) { lbW.text = "Restante semanal: $p%" }
+                override fun onStartTrackingTouch(s: SeekBar?) {}
+                override fun onStopTrackingTouch(s: SeekBar?) {}
+              })
+              val btnSave = Button(this).apply { text = "Actualizar burbuja manualmente"; setBackgroundColor(0xFF1557B0.toInt()); setTextColor(Color.WHITE); layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(context, 12) } }
+              btnSave.setOnClickListener { Store.save(this, sb5.progress, sbW.progress); render(); Toast.makeText(this, "Burbuja actualizada", Toast.LENGTH_SHORT).show() }
+              root.addView(lb5); root.addView(sb5); root.addView(lbW); root.addView(sbW); root.addView(btnSave)
+              setContentView(ScrollView(this).apply { addView(root) })
+            }
+            override fun onResume() {
+              super.onResume()
+              if (Build.VERSION.SDK_INT >= 33) registerReceiver(rx, IntentFilter(Store.ACTION), Context.RECEIVER_NOT_EXPORTED)
+              else registerReceiver(rx, IntentFilter(Store.ACTION))
+              render(); updateBtn()
+            }
+            override fun onPause() { super.onPause(); try { unregisterReceiver(rx) } catch (_: Exception) {} }
+            private fun render() {
+              val h5 = Store.get5h(this); val wk = Store.getWk(this)
+              tv5.text = "5h $h5%"; tvW.text = "Sem $wk%"; tvTs.text = "Última actualización: ${Store.getTime(this)}"
+              sb5.progress = h5; sbW.progress = wk; lb5.text = "Restante 5 horas: $h5%"; lbW.text = "Restante semanal: $wk%"
+            }
+            private fun updateBtn() {
+              btnToggle.text = when {
+                !Settings.canDrawOverlays(this) -> "Conceder permiso de superposición"
+                Store.isRun(this) -> "Ocultar burbuja"
+                else -> "Activar burbuja flotante"
+              }
+            }
+            private fun startFlow() {
+              if (!Settings.canDrawOverlays(this)) {
+                startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                Toast.makeText(this, "Activá 'Mostrar sobre otras apps'", Toast.LENGTH_LONG).show(); return
+              }
+              if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 101); return
+              }
+              startForegroundService(Intent(this, BubbleService::class.java)); Store.setRun(this, true); updateBtn()
+            }
+            override fun onRequestPermissionsResult(rc: Int, p: Array<out String>, r: IntArray) {
+              super.onRequestPermissionsResult(rc, p, r)
+              startForegroundService(Intent(this, BubbleService::class.java)); Store.setRun(this, true); updateBtn()
+            }
+          }
+
+          class SyncActivity : Activity() {
+            private lateinit var wv: WebView; private lateinit var st: TextView
+            @SuppressLint("SetJavaScriptEnabled")
+            override fun onCreate(b: Bundle?) {
+              super.onCreate(b)
+              val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+              val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setBackgroundColor(0xFF1A73E8.toInt()); setPadding(dp(context, 10), dp(context, 10), dp(context, 10), dp(context, 10)); gravity = Gravity.CENTER_VERTICAL }
+              val title = TextView(this).apply { text = "Abrí Límites de uso en Gemini"; setTextColor(Color.WHITE); textSize = 13f; layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f) }
+              val btn = Button(this).apply { text = "Leer ahora"; setBackgroundColor(Color.WHITE); setTextColor(0xFF0D47A1.toInt()) }
+              bar.addView(title); bar.addView(btn)
+              st = TextView(this).apply { text = "Cargando gemini.google.com/usage..."; setBackgroundColor(0xFFE8F0FE.toInt()); setTextColor(0xFF0D47A1.toInt()); setPadding(dp(context, 10), dp(context, 6), dp(context, 10), dp(context, 6)); textSize = 12f }
+              wv = WebView(this).apply { layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f) }
+              CookieManager.getInstance().setAcceptCookie(true)
+              CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
+              wv.settings.javaScriptEnabled = true; wv.settings.domStorageEnabled = true
+              wv.webChromeClient = WebChromeClient()
+              wv.webViewClient = object : WebViewClient() {
+                override fun onPageFinished(v: WebView?, u: String?) { st.text = "Cuando veas tus porcentajes, tocá 'Leer ahora'." }
+              }
+              btn.setOnClickListener { readUsage() }
+              root.addView(bar); root.addView(st); root.addView(wv)
+              setContentView(root)
+              wv.loadUrl("https://gemini.google.com/usage")
+            }
+            private fun readUsage() {
+              val js = "(function(){const t=(document.body&&document.body.innerText)||'';const ls=t.split(/\\r?\\n/).map(s=>s.trim()).filter(Boolean);function fp(ks){for(let i=0;i<ls.length;i++){const lo=ls[i].toLowerCase();if(ks.some(k=>lo.includes(k))){const w=ls.slice(i,i+4).join(' ');const m=w.match(/(\\d{1,3})\\s*%/);if(m){const v=parseInt(m[1],10);return /restante|remaining|left|disponible/i.test(w)?v:Math.max(0,Math.min(100,100-v));}}}return -1;}let h5=fp(['5 hour','5-hour','5 hora','5 horas','five hour']);let wk=fp(['weekly','semanal','semana','week']);if(h5<0||wk<0){const all=[...ls.join(' ').matchAll(/(\\d{1,3})\\s*%/g)].map(m=>parseInt(m[1],10));if(h5<0&&all.length>=1)h5=Math.max(0,Math.min(100,100-all[0]));if(wk<0&&all.length>=2)wk=Math.max(0,Math.min(100,100-all[1]));}return JSON.stringify({h5:h5,wk:wk});})();"
+              wv.evaluateJavascript(js) { res ->
+                try {
+                  val s = res?.trim()?.removeSurrounding("\"")?.replace("\\\"", "\"") ?: "{}"
+                  val o = JSONObject(s); val h5 = o.optInt("h5", -1); val wk = o.optInt("wk", -1)
+                  if (h5 in 0..100 && wk in 0..100) {
+                    Store.save(this, h5, wk)
+                    Toast.makeText(this, "Sincronizado: 5h $h5% · Sem $wk%", Toast.LENGTH_LONG).show()
+                    finish()
+                  } else st.text = "No se detectaron los porcentajes. Entrá a Ajustes → Límites de uso y tocá 'Leer ahora'."
+                } catch (_: Exception) { st.text = "No se pudo leer la página; podés actualizar manualmente." }
+              }
+            }
+          }
+          EOF
+      - name: Build APK
+        run: gradle assembleDebug
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GeminiUsageBubble-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+      - name: Publish Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk GeminiUsageBubble.apk
+          gh release delete v1.0.0 -y || true
+          gh release create v1.0.0 GeminiUsageBubble.apk --title "GeminiUsageBubble v1.0.0" --notes "Burbuja flotante azul para porcentaje restante de Gemini (5h y semanal)."
