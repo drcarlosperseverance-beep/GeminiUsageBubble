@@ -47,8 +47,8 @@ jobs:
               applicationId = "com.geminibubble.app"
               minSdk = 26
               targetSdk = 35
-              versionCode = 2
-              versionName = "1.1.0"
+              versionCode = 3
+              versionName = "1.2.0"
             }
             compileOptions {
               sourceCompatibility = JavaVersion.VERSION_17
@@ -100,6 +100,8 @@ jobs:
           import android.widget.*
           import org.json.JSONObject
           import kotlin.math.abs
+          import kotlin.math.hypot
+          import kotlin.math.max
 
           object Store {
             const val ACTION_UPDATED = "com.geminibubble.app.UPDATED"
@@ -116,9 +118,6 @@ jobs:
             fun getMin(c: Context) = prefs(c).getInt("min", 2).coerceIn(2, 60)
             fun isRun(c: Context) = prefs(c).getBoolean("run", false)
             fun setRun(c: Context, v: Boolean) = prefs(c).edit().putBoolean("run", v).apply()
-            fun savePos(c: Context, x: Int, y: Int) = prefs(c).edit().putInt("px", x).putInt("py", y).apply()
-            fun posX(c: Context) = prefs(c).getInt("px", 40)
-            fun posY(c: Context) = prefs(c).getInt("py", 220)
 
             fun saveConfig(c: Context, auto: Boolean, min: Int) {
               prefs(c).edit().putBoolean("auto", auto).putInt("min", min.coerceIn(2, 60)).apply()
@@ -156,11 +155,21 @@ jobs:
             setStroke(dp(c, 1), 0x88B3E5FC.toInt())
           }
 
+          fun dismissBg(c: Context, active: Boolean) = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(if (active) 0xEEE53935.toInt() else 0xCC222222.toInt())
+            setStroke(dp(c, 2), 0xCCFFFFFF.toInt())
+          }
+
           class BubbleService : Service() {
-            companion object { const val STOP = "com.geminibubble.app.STOP"; const val CH = "gb_ch" }
+            companion object {
+              const val STOP = "com.geminibubble.app.STOP"
+              const val CH = "gb_ch_min_v2"
+            }
             private lateinit var wm: WindowManager
             private val handler = Handler(Looper.getMainLooper())
             private var view: View? = null
+            private var dismissView: TextView? = null
             private var bgWebView: WebView? = null
             private var tv5: TextView? = null
             private var tvW: TextView? = null
@@ -198,8 +207,15 @@ jobs:
             override fun onCreate() {
               super.onCreate()
               wm = getSystemService(WINDOW_SERVICE) as WindowManager
-              getSystemService(NotificationManager::class.java).createNotificationChannel(
-                NotificationChannel(CH, "UsageBubble Gemini", NotificationManager.IMPORTANCE_LOW)
+              val nm = getSystemService(NotificationManager::class.java)
+              nm.deleteNotificationChannel("gb_ch")
+              nm.createNotificationChannel(
+                NotificationChannel(CH, "UsageBubble Gemini (silenciosa)", NotificationManager.IMPORTANCE_MIN).apply {
+                  setShowBadge(false)
+                  enableLights(false)
+                  enableVibration(false)
+                  lockscreenVisibility = Notification.VISIBILITY_SECRET
+                }
               )
               if (Build.VERSION.SDK_INT >= 34) startForeground(1, notif(), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
               else startForeground(1, notif())
@@ -284,6 +300,32 @@ jobs:
             @SuppressLint("ClickableViewAccessibility")
             private fun showBubble() {
               if (view != null) return
+              val dm = resources.displayMetrics
+              val sw = dm.widthPixels
+              val sh = dm.heightPixels
+
+              val dSize = dp(this, 56)
+              val dView = TextView(this).apply {
+                text = "✕"
+                setTextColor(Color.WHITE)
+                textSize = 22f
+                setTypeface(null, Typeface.BOLD)
+                gravity = Gravity.CENTER
+                background = dismissBg(context, false)
+                elevation = dp(context, 8).toFloat()
+                visibility = View.GONE
+              }
+              val dLp = WindowManager.LayoutParams(
+                dSize, dSize, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+                PixelFormat.TRANSLUCENT
+              ).apply {
+                gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+                y = dp(this@BubbleService, 48)
+              }
+              wm.addView(dView, dLp)
+              dismissView = dView
+
               val box = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 gravity = Gravity.CENTER
@@ -306,29 +348,74 @@ jobs:
                 gravity = Gravity.CENTER; includeFontPadding = false
               }
               box.addView(tv5); box.addView(tvW); box.addView(tvT)
+
               val lp = WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
                 PixelFormat.TRANSLUCENT
               ).apply {
                 gravity = Gravity.TOP or Gravity.START
-                x = Store.posX(this@BubbleService)
-                y = Store.posY(this@BubbleService)
+                x = max(0, (sw - dp(this@BubbleService, 60)) / 2)
+                y = max(dp(this@BubbleService, 24), (sh - dp(this@BubbleService, 56)) / 2)
               }
-              var ix = 0; var iy = 0; var tx = 0f; var ty = 0f; var drag = false
+
+              var ix = 0; var iy = 0; var tx = 0f; var ty = 0f
+              var drag = false; var overDismiss = false
+
               box.setOnTouchListener { _, e ->
+                val curDm = resources.displayMetrics
+                val curW = curDm.widthPixels
+                val curH = curDm.heightPixels
+                val bw = max(box.width, dp(this, 60))
+                val bh = max(box.height, dp(this, 56))
+                val maxX = max(0, curW - bw)
+                val minY = dp(this, 16)
+                val maxY = max(minY, curH - bh - dp(this, 36))
+
                 when (e.action) {
-                  MotionEvent.ACTION_DOWN -> { ix = lp.x; iy = lp.y; tx = e.rawX; ty = e.rawY; drag = false; true }
+                  MotionEvent.ACTION_DOWN -> {
+                    ix = lp.x; iy = lp.y; tx = e.rawX; ty = e.rawY
+                    drag = false; overDismiss = false
+                    true
+                  }
                   MotionEvent.ACTION_MOVE -> {
                     val dx = (e.rawX - tx).toInt(); val dy = (e.rawY - ty).toInt()
-                    if (abs(dx) > 12 || abs(dy) > 12) drag = true
-                    lp.x = ix + dx; lp.y = iy + dy; wm.updateViewLayout(box, lp); true
+                    if (abs(dx) > 12 || abs(dy) > 12) {
+                      if (!drag) {
+                        drag = true
+                        dismissView?.visibility = View.VISIBLE
+                      }
+                    }
+                    lp.x = (ix + dx).coerceIn(0, maxX)
+                    lp.y = (iy + dy).coerceIn(minY, maxY)
+                    wm.updateViewLayout(box, lp)
+
+                    if (drag) {
+                      val targetX = curW / 2f
+                      val targetY = curH - dp(this, 76).toFloat()
+                      val dist = hypot((e.rawX - targetX).toDouble(), (e.rawY - targetY).toDouble())
+                      val nowOver = dist < dp(this, 72)
+                      if (nowOver != overDismiss) {
+                        overDismiss = nowOver
+                        dismissView?.background = dismissBg(this, overDismiss)
+                        dismissView?.scaleX = if (overDismiss) 1.18f else 1f
+                        dismissView?.scaleY = if (overDismiss) 1.18f else 1f
+                      }
+                    }
+                    true
                   }
-                  MotionEvent.ACTION_UP -> {
-                    Store.savePos(this, lp.x, lp.y)
-                    if (!drag) startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP))
+                  MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    dismissView?.visibility = View.GONE
+                    dismissView?.scaleX = 1f
+                    dismissView?.scaleY = 1f
+                    dismissView?.background = dismissBg(this, false)
+                    if (drag && overDismiss) {
+                      stopSelf()
+                    } else if (!drag) {
+                      startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP))
+                    }
                     true
                   }
                   else -> false
@@ -347,9 +434,10 @@ jobs:
               val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
               val stop = PendingIntent.getService(this, 1, Intent(this, BubbleService::class.java).setAction(STOP), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
               return Notification.Builder(this, CH)
-                .setSmallIcon(android.R.drawable.ic_dialog_info)
+                .setSmallIcon(android.R.drawable.ic_menu_view)
                 .setContentTitle("UsageBubble Gemini")
                 .setContentText("5h ${Store.get5h(this)}% · S ${Store.getWk(this)}% · ${Store.relTime(Store.getTs(this))}")
+                .setShowWhen(false)
                 .setOngoing(true).setContentIntent(open)
                 .addAction(Notification.Action.Builder(null, "Ocultar", stop).build())
                 .build()
@@ -363,6 +451,7 @@ jobs:
               handler.removeCallbacksAndMessages(null)
               try { unregisterReceiver(rx) } catch (_: Exception) {}
               view?.let { try { wm.removeView(it) } catch (_: Exception) {} }; view = null
+              dismissView?.let { try { wm.removeView(it) } catch (_: Exception) {} }; dismissView = null
               bgWebView?.let {
                 try { wm.removeView(it) } catch (_: Exception) {}
                 it.destroy()
@@ -385,7 +474,7 @@ jobs:
                 setPadding(dp(context, 20), dp(context, 22), dp(context, 20), dp(context, 24))
               }
               root.addView(TextView(this).apply { text = "UsageBubble Gemini"; textSize = 24f; setTypeface(null, Typeface.BOLD); setTextColor(0xFF1565C0.toInt()) })
-              root.addView(TextView(this).apply { text = "Burbuja compacta aurora para 5h y semanal (S) con auto-actualización."; textSize = 13f; setTextColor(0xFF486581.toInt()); setPadding(0, dp(context, 4), 0, dp(context, 16)) })
+              root.addView(TextView(this).apply { text = "Burbuja compacta aurora para 5h y semanal (S). Arrastrala a la X de abajo para cerrarla."; textSize = 13f; setTextColor(0xFF486581.toInt()); setPadding(0, dp(context, 4), 0, dp(context, 16)) })
 
               val preview = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER; background = auroraBg(context)
@@ -560,12 +649,12 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: GeminiUsageBubble-v1.1.0-APK
+          name: GeminiUsageBubble-v1.2.0-APK
           path: app/build/outputs/apk/debug/app-debug.apk
       - name: Publish Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          cp app/build/outputs/apk/debug/app-debug.apk GeminiUsageBubble-v1.1.0.apk
-          gh release delete v1.1.0 -y || true
-          gh release create v1.1.0 GeminiUsageBubble-v1.1.0.apk --title "GeminiUsageBubble v1.1.0" --notes "Burbuja cuadradita compacta estilo aurora boreal, formato 5h / S / tiempo relativo y auto-actualización configurable desde 2 minutos."
+          cp app/build/outputs/apk/debug/app-debug.apk GeminiUsageBubble-v1.2.0.apk
+          gh release delete v1.2.0 -y || true
+          gh release create v1.2.0 GeminiUsageBubble-v1.2.0.apk --title "GeminiUsageBubble v1.2.0" --notes "Bordes bloqueados, aparición en el centro al encender, zona de cierre con X abajo y notificación silenciosa sin icono en la barra superior.":
